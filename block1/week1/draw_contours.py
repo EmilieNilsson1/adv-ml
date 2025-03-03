@@ -1,0 +1,237 @@
+import torch as th 
+import torch.distributions as td
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+def project_to_pca_space(mu, sigma, principal_components):
+    mu_new = mu @ principal_components
+    sigma_new = principal_components.T @ sigma @ principal_components
+    return mu_new, sigma_new
+
+def diag_from_std(sigma):
+    diag = th.zeros(sigma.shape[0], sigma.shape[1], sigma.shape[1])
+    for i in range(sigma.shape[0]):
+        diag[i] = th.diag(sigma[i])
+    return diag 
+
+def evaluate_distribution_on_grid(distribution, max_v, min_v, n_points=100):
+    x = th.linspace(min_v[0],max_v[0],n_points)
+    y = th.linspace(min_v[1],max_v[1],n_points)
+    X,Y = th.meshgrid(x,y)
+    grid = th.stack([X,Y], dim=-1)
+    grid = grid.view(-1,2)
+    log_probs = distribution.log_prob(grid).detach()
+    return th.exp(log_probs).view(n_points,n_points), X, Y
+
+def draw_contours( data_mean, data_std, prior_dist, img_name, multivariate=False):
+ 
+    if multivariate:
+        prior_mean = prior_dist.component_distribution.mean
+        prior_std = prior_dist.component_distribution.stddev
+    else:
+        prior_mean = prior_dist.mean.unsqueeze(0)
+        prior_std = prior_dist.stddev.unsqueeze(0)
+    
+    n_datapoints = len(data_mean)
+    k = len(prior_mean)
+    # Project to 2D space 
+    # We should standardize the means before doing PCA on them, but I am not sure what effect that has on the distributions they describe? 
+    # Perform PCA
+    pca = PCA(n_components=2)  # Set the number of components
+    pca.fit_transform(data_mean.detach().numpy())
+
+    principal_components = th.Tensor(pca.components_).T
+    
+    data_mean_2d, data_std_2d = project_to_pca_space(data_mean, diag_from_std(data_std), principal_components)
+    prior_mean_2d, prior_std_2d = project_to_pca_space(prior_mean, diag_from_std(prior_std), principal_components)
+
+    # Re-create distributions 
+    prior_components_2d = td.MultivariateNormal(prior_mean_2d, prior_std_2d)
+    prior_weights_2d = td.Categorical(probs=th.ones(k)/k)
+    prior_distribution_2d = td.MixtureSameFamily(prior_weights_2d, prior_components_2d)
+
+    data_components_2d = td.MultivariateNormal(data_mean_2d, data_std_2d)
+    data_weights_2d = td.Categorical(probs=th.ones(n_datapoints)/n_datapoints)
+    data_distribution_2d = td.MixtureSameFamily(data_weights_2d, data_components_2d)
+    
+    # Plot contours 
+    data_points_2d = data_mean @ principal_components
+    max_data = th.max(data_points_2d, dim=0).values
+    min_data = th.min(data_points_2d, dim=0).values
+
+    grid_data, X, Y = evaluate_distribution_on_grid(data_distribution_2d, max_data, min_data)
+    grid_prior, _, _ = evaluate_distribution_on_grid(prior_distribution_2d, max_data, min_data)
+
+    # Random points to show : 
+    # n_points = 1000
+    # random_points = th.random.choice()
+
+    fig, ax = plt.subplots(1,3, figsize=(15,5))
+
+    contour1 = ax[0].contourf(X, Y, grid_data, cmap='viridis')
+    ax[0].axis('off')
+    ax[0].set_title('Aggregate Posterior')
+
+    contour2 = ax[1].contourf(X, Y, grid_prior, cmap='viridis')
+    ax[1].axis('off')
+    ax[1].set_title('Prior')
+
+    contour3 = ax[2].contourf(X, Y, grid_data - grid_prior, cmap='viridis')
+    ax[2].axis('off')
+    ax[2].set_title('Difference')
+    fig.colorbar(contour1, ax=ax[0], orientation='horizontal', pad=0.01)
+    fig.colorbar(contour2, ax=ax[1], orientation='horizontal', pad=0.01)
+    fig.colorbar(contour3, ax=ax[2], orientation='horizontal', pad=0.01)
+
+    fig.tight_layout()
+    plt.savefig(img_name)
+    
+def draw_contours_points( data_mean, data_std, prior_dist, img_name, multivariate=False):
+ 
+    if multivariate:
+        prior_mean = prior_dist.component_distribution.mean
+        prior_std = prior_dist.component_distribution.stddev
+        prior_weights = prior_dist.mixture_distribution.probs
+    else:
+        prior_mean = prior_dist.mean.unsqueeze(0)
+        prior_std = prior_dist.stddev.unsqueeze(0)
+    
+    n_datapoints = len(data_mean)
+    k = len(prior_mean)
+    # Project to 2D space 
+    # We should standardize the means before doing PCA on them, but I am not sure what effect that has on the distributions they describe? 
+    # Perform PCA
+    pca = PCA(n_components=2)  # Set the number of components
+    pca.fit_transform(data_mean.detach().numpy())
+
+    principal_components = th.Tensor(pca.components_).T
+    
+    data_mean_2d, data_std_2d = project_to_pca_space(data_mean, diag_from_std(data_std), principal_components)
+    prior_mean_2d, prior_std_2d = project_to_pca_space(prior_mean, diag_from_std(prior_std), principal_components)
+
+    # Re-create distributions 
+    prior_components_2d = td.MultivariateNormal(prior_mean_2d, prior_std_2d)
+    prior_weights_2d = td.Categorical(probs=prior_weights)
+    prior_distribution_2d = td.MixtureSameFamily(prior_weights_2d, prior_components_2d)
+
+    data_components_2d = td.MultivariateNormal(data_mean_2d, data_std_2d)
+    data_weights_2d = td.Categorical(probs=th.ones(n_datapoints)/n_datapoints)
+    data_distribution_2d = td.MixtureSameFamily(data_weights_2d, data_components_2d)
+    
+    # Plot contours 
+    data_points_2d = data_mean @ principal_components
+    max_data = [3, 3] # th.max(data_points_2d, dim=0).values
+    min_data = [-3, -3] #th.min(data_points_2d, dim=0).values
+
+    grid_data, X, Y = evaluate_distribution_on_grid(data_distribution_2d, max_data, min_data)
+    grid_prior, _, _ = evaluate_distribution_on_grid(prior_distribution_2d, max_data, min_data)
+
+    # Random points to show : 
+    # n_points = 1000
+    # random_points = th.random.choice()
+
+    fig, ax = plt.subplots(1,4, figsize=(15,5))
+
+    ax[0].plot(data_points_2d[:,0], data_points_2d[:,1], 'y,', alpha=0.2)
+    ax[0].set_ylim(min_data[0], max_data[0])
+    ax[0].set_xlim(min_data[1], max_data[1])
+
+
+    contour1 = ax[1].contourf(X, Y, grid_data, cmap='viridis')
+    # ax[1].axis('off')
+    ax[1].set_title('Aggregate Posterior')
+
+    contour2 = ax[2].contourf(X, Y, grid_prior, cmap='viridis')
+    ax[2].axis('off')
+    ax[2].set_title('Prior')
+
+    contour3 = ax[3].contourf(X, Y, grid_data - grid_prior, cmap='viridis')
+    ax[3].axis('off')
+    ax[3].set_title('Difference')
+    fig.colorbar(contour1, ax=ax[1], orientation='horizontal', pad=0.01)
+    fig.colorbar(contour2, ax=ax[2], orientation='horizontal', pad=0.01)
+    fig.colorbar(contour3, ax=ax[3], orientation='horizontal', pad=0.01)
+
+    fig.tight_layout()
+    plt.savefig(img_name)
+
+def draw_contours_points_2d(data_mean, data_std, prior_dist, img_name, multivariate=False):
+ 
+    if multivariate:
+        prior_mean = prior_dist.component_distribution.mean
+        prior_std = prior_dist.component_distribution.stddev
+        prior_weights = prior_dist.mixture_distribution.probs
+    else:
+        prior_mean = prior_dist.mean.unsqueeze(0)
+        prior_std = prior_dist.stddev.unsqueeze(0)
+    
+    n_datapoints = len(data_mean)
+    k = len(prior_mean)
+
+    prior_std = diag_from_std(prior_std)
+    data_std = diag_from_std(data_std)
+    # Re-create distributions 
+    prior_components_2d = td.MultivariateNormal(prior_mean, prior_std)
+    prior_weights_2d = td.Categorical(probs=prior_weights)
+    prior_distribution_2d = td.MixtureSameFamily(prior_weights_2d, prior_components_2d)
+
+    data_components_2d = td.MultivariateNormal(data_mean, data_std)
+    data_weights_2d = td.Categorical(probs=th.ones(n_datapoints)/n_datapoints)
+    data_distribution_2d = td.MixtureSameFamily(data_weights_2d, data_components_2d)
+    
+    # Plot contours 
+    data_points_2d = data_mean
+    max_data = th.max(data_points_2d, dim=0).values
+    min_data = th.min(data_points_2d, dim=0).values
+
+    grid_data, X, Y = evaluate_distribution_on_grid(data_distribution_2d, max_data, min_data)
+    grid_prior, _, _ = evaluate_distribution_on_grid(prior_distribution_2d, max_data, min_data)
+
+    # Random points to show : 
+    # n_points = 1000
+    # random_points = th.random.choice()
+
+    fig, ax = plt.subplots(1,4, figsize=(15,5))
+
+    ax[0].plot(data_points_2d[:,0], data_points_2d[:,1], 'y.', alpha=0.01)
+
+    contour1 = ax[1].contourf(X, Y, grid_data, cmap='viridis')
+    ax[1].axis('off')
+    ax[1].set_title('Aggregate Posterior')
+
+    contour2 = ax[2].contourf(X, Y, grid_prior, cmap='viridis')
+    ax[2].axis('off')
+    ax[2].set_title('Prior')
+
+    contour3 = ax[3].contourf(X, Y, grid_data - grid_prior, cmap='viridis')
+    ax[3].axis('off')
+    ax[3].set_title('Difference')
+    fig.colorbar(contour1, ax=ax[1], orientation='horizontal', pad=0.01)
+    fig.colorbar(contour2, ax=ax[2], orientation='horizontal', pad=0.01)
+    fig.colorbar(contour3, ax=ax[3], orientation='horizontal', pad=0.01)
+
+    fig.tight_layout()
+    plt.savefig(img_name)
+
+    
+
+if __name__ == '__main__':
+    k = 10 
+    d = 32 
+
+    # Distribution for parameters of the Gaussian components
+    mus = th.randn(k, d)
+    sigmas = th.rand(k, d)**2
+
+    gaus_distributions = td.Independent(td.Normal(mus, sigmas), 1)
+    distribution = td.Categorical(probs=th.ones(k)/k)
+    mixture = td.MixtureSameFamily(distribution, gaus_distributions)
+
+    # Datapoints distributions 
+    n_datapoints = 60000
+    encoded_m = th.randn(n_datapoints, d)
+    encoded_s = 0.1*th.ones(n_datapoints, d) #th.randn(n_datapoints, 2)**2
+    data_components = td.Independent(td.Normal(encoded_m, encoded_s), 1)
+    data_weights = td.Categorical(probs=th.ones(n_datapoints)/n_datapoints)
+    data_distribution = td.MixtureSameFamily(data_weights, data_components)
+    
