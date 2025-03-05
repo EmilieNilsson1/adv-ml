@@ -71,9 +71,9 @@ class MoGPrior(nn.Module):
         super(MoGPrior, self).__init__()
         self.M = M
         self.k = k
-        self.mean = nn.Parameter(torch.zeros(self.k,self.M), requires_grad=True)
-        self.std = nn.Parameter(torch.ones(self.k,self.M), requires_grad=True)
-        self.weights = nn.Parameter(torch.ones(self.k,), requires_grad=True)
+        self.mean = nn.Parameter(torch.randn(self.k,self.M), requires_grad=True)
+        self.std = nn.Parameter(torch.randn(self.k,self.M), requires_grad=True)
+        self.weights = nn.Parameter(torch.ones(self.k,), requires_grad=False)
     
     def forward(self):
         mix = td.Categorical(F.softmax(self.weights))
@@ -329,14 +329,15 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='sample', choices=['train', 'sample', 'eval', 'pca', 'train_multiple'], help='what to do when running the script (default: %(default)s)')
-    parser.add_argument('--model', type=str, default='model_vamp_l-2_e-100.pt', help='file to save model to or load model from (default: %(default)s)')
+    parser.add_argument('--model', type=str, default='model_wf', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=100, metavar='N', help='number of epochs to train (default: %(default)s)')
     parser.add_argument('--latent-dim', type=int, default=2, metavar='N', help='dimension of latent variable (default: %(default)s)')
-    parser.add_argument('--prior', type=str, default='vamp', choices=['gaussian', 'mog', 'vamp'], help='prior distribution (default: %(default)s)')
+    parser.add_argument('--prior', type=str, default='mog', choices=['gaussian', 'mog', 'vamp'], help='prior distribution (default: %(default)s)')
     parser.add_argument('--decode', type=str, default='Bernoulli', choices=['Bernoulli', 'Gaussian'], help='decoder distribution (default: %(default)s)')
+    parser.add_argument('--seed', type=int, default=1, help='Seed to train on (default: %(default)s)')
     
     args = parser.parse_args()
     print('# Options')
@@ -396,6 +397,7 @@ if __name__ == "__main__":
     # prior = MoGPrior(M) if args.prior == 'mog' else GaussianPrior(M)
 
     model = VAE(prior, decoder, encoder).to(device)
+    model_name = args.model + args.prior + "ld"+str(args.latent_dim) + "e"+str(args.epochs) + ".pt"
 
 
     # Choose mode to run
@@ -407,10 +409,10 @@ if __name__ == "__main__":
         train(model, optimizer, mnist_train_loader, args.epochs, args.device)
 
         # Save model
-        torch.save(model.state_dict(), args.model)
+        torch.save(model.state_dict(), model_name)
 
     elif args.mode == 'sample':
-        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+        model.load_state_dict(torch.load(model_name, map_location=torch.device(args.device)))
 
         # Generate samples
         model.eval()
@@ -431,14 +433,14 @@ if __name__ == "__main__":
             means = torch.cat(means, dim=0)
             std = torch.cat(std, dim=0)
 
-        draw_contours(means, std, model.prior(), f"contours_{args.prior}_{args.latent_dim}.png", multivariate="gaussian"!=args.prior)
+        # draw_contours(means, std, model.prior(), f"contours_{args.prior}_{args.latent_dim}.png", multivariate="gaussian"!=args.prior)
         draw_contours_points(means, std, model.prior(), f"contoursp_{args.prior}_{args.latent_dim}.png", multivariate="gaussian"!=args.prior)
         # draw_contours_points_2d(means, std, model.prior(), f"contoursp2_{args.prior}_{args.latent_dim}.png", multivariate="gaussian"!=args.prior)
 
     
     elif args.mode == 'eval':
 
-        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+        model.load_state_dict(torch.load(model_name, map_location=torch.device(args.device)))
 
         # Evaluate ELBO
         elbo_test = evaluate(model, mnist_test_loader, args.device)
@@ -447,4 +449,85 @@ if __name__ == "__main__":
     elif args.mode == "pca":
 
         # Sample from posterior
-        sample_posterior(model, mnist_test_loader, M, args.model,  args.device)
+        sample_posterior(model, mnist_test_loader, M, model_name,  args.device)
+
+
+# if __name__ == "__main__":
+#     from torchvision import datasets, transforms
+#     from torchvision.utils import save_image, make_grid
+#     import glob
+
+#     priors = ['gaussian', 'mog', 'vamp']
+#     seeds = [0, 1, 2]#, 3, 4]
+#     epochs = 100
+#     latent_dim = 2
+#     batch_size = 64
+#     M = latent_dim
+#     # Define encoder and decoder networks
+
+
+#     def main(prior_n, seed):
+#         encoder_net = nn.Sequential(
+#             nn.Flatten(),
+#             nn.Linear(784, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, M*2),
+#         )
+
+#         decoder_net = nn.Sequential(
+#             nn.Linear(M, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 784),
+#             nn.Unflatten(-1, (28, 28))
+#         )
+
+#         # Define VAE model
+#         decoder = BernoulliDecoder(decoder_net)
+#         encoder = GaussianEncoder(encoder_net)
+
+#         torch.manual_seed(seed)
+#         device = 'cpu'
+
+#             # Define prior distribution
+#         if prior_n == 'vamp':
+#             prior = VampPrior(784, 10, encoder)
+#         elif prior_n == 'gaussian':
+#             prior = GaussianPrior(M)
+#         else:
+#             prior = MoGPrior(M) 
+
+
+#         thresshold = 0.5
+#         mnist_train_loader = torch.utils.data.DataLoader(datasets.MNIST('data/', train=True, download=True,
+#                                                                     transform=transforms.Compose([transforms.ToTensor(), transforms.Lambda(lambda x: (thresshold < x).float().squeeze())])),
+#                                                     batch_size=batch_size, shuffle=True)
+#         mnist_test_loader = torch.utils.data.DataLoader(datasets.MNIST('data/', train=False, download=True,
+#                                                                 transform=transforms.Compose([transforms.ToTensor(), transforms.Lambda(lambda x: (thresshold < x).float().squeeze())])),
+#                                                     batch_size=batch_size, shuffle=True)
+
+#         model = VAE(prior, decoder, encoder).to(device)
+#         # Define optimizer
+#         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+#         # Train model
+#         train(model, optimizer, mnist_train_loader, epochs, device)
+#         torch.save(model.state_dict(), f"models_{prior_n}/model_p-{prior_n}_d-{latent_dim}_s-{seed}_e-{epochs}.pt")
+
+#         return evaluate(model, mnist_test_loader, device)
+
+#     elbos = {}
+#     for prior in priors:
+#         elbos[prior] = []
+#         for seed in seeds:
+#             elbos[prior].append(main(prior, seed))
+
+#     # calculate mean and std of elbos
+#     for prior in priors:
+#         mean = torch.tensor(elbos[prior]).mean()
+#         std = torch.tensor(elbos[prior]).std()
+#         print(f"Prior: {prior}, Mean ELBO: {mean:.4f}, Std ELBO: {std:.4f}")
+#     torch.save(elbos, "elbos.pth")

@@ -2,6 +2,7 @@ import torch as th
 import torch.distributions as td
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from matplotlib.cm import ScalarMappable
 
 def project_to_pca_space(mu, sigma, principal_components):
     mu_new = mu @ principal_components
@@ -95,6 +96,7 @@ def draw_contours_points( data_mean, data_std, prior_dist, img_name, multivariat
     else:
         prior_mean = prior_dist.mean.unsqueeze(0)
         prior_std = prior_dist.stddev.unsqueeze(0)
+        prior_weights = th.ones(1)
     
     n_datapoints = len(data_mean)
     k = len(prior_mean)
@@ -125,6 +127,8 @@ def draw_contours_points( data_mean, data_std, prior_dist, img_name, multivariat
 
     grid_data, X, Y = evaluate_distribution_on_grid(data_distribution_2d, max_data, min_data)
     grid_prior, _, _ = evaluate_distribution_on_grid(prior_distribution_2d, max_data, min_data)
+    vmax = th.max(grid_data.max(), grid_prior.max())
+    vmin = 0#th.min(grid_data.min(), grid_prior.min())
 
     # Random points to show : 
     # n_points = 1000
@@ -135,22 +139,35 @@ def draw_contours_points( data_mean, data_std, prior_dist, img_name, multivariat
     ax[0].plot(data_points_2d[:,0], data_points_2d[:,1], 'y,', alpha=0.2)
     ax[0].set_ylim(min_data[0], max_data[0])
     ax[0].set_xlim(min_data[1], max_data[1])
+    ax[0].set_title('Aggregate Posterior Mean Samples')
 
-
-    contour1 = ax[1].contourf(X, Y, grid_data, cmap='viridis')
-    # ax[1].axis('off')
+    contour1 = ax[1].pcolormesh(X, Y, grid_data, cmap='viridis', vmin=vmin, vmax=vmax)
+    ax[1].contour(X, Y, grid_data, linewidths=1, colors='black', vmin=vmin, vmax=vmax)
+    ax[1].axis('off')
     ax[1].set_title('Aggregate Posterior')
 
-    contour2 = ax[2].contourf(X, Y, grid_prior, cmap='viridis')
+    contour2 = ax[2].pcolormesh(X, Y, grid_prior, cmap='viridis', vmin=vmin, vmax=vmax)
+    ax[2].contour(X, Y, grid_prior, linewidths=1, colors='black', vmin=vmin, vmax=vmax)
     ax[2].axis('off')
     ax[2].set_title('Prior')
 
-    contour3 = ax[3].contourf(X, Y, grid_data - grid_prior, cmap='viridis')
+    contour3 = ax[3].pcolormesh(X, Y, th.abs(grid_data - grid_prior), cmap='viridis', vmin=vmin, vmax=vmax)
+    ax[3].contour(X, Y, grid_data - grid_prior, linewidths=1, colors='black')
     ax[3].axis('off')
     ax[3].set_title('Difference')
     fig.colorbar(contour1, ax=ax[1], orientation='horizontal', pad=0.01)
     fig.colorbar(contour2, ax=ax[2], orientation='horizontal', pad=0.01)
     fig.colorbar(contour3, ax=ax[3], orientation='horizontal', pad=0.01)
+    dummy_contour = ScalarMappable(cmap='viridis')
+    dummy_contour.set_array([])
+    dummy_cbar = fig.colorbar(dummy_contour, ax=ax[0], orientation='horizontal', pad=0.01)
+    dummy_cbar.outline.set_visible(False)
+    dummy_cbar.ax.set_xticklabels([])
+    dummy_cbar.ax.set_xticks([])
+    dummy_cbar.ax.set_yticklabels([])
+    dummy_cbar.ax.set_yticks([])
+    dummy_cbar.set_alpha(0.0)
+    dummy_cbar.ax.set_visible(False)
 
     fig.tight_layout()
     plt.savefig(img_name)
