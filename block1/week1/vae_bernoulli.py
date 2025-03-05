@@ -73,7 +73,7 @@ class MoGPrior(nn.Module):
         self.k = k
         self.mean = nn.Parameter(torch.randn(self.k,self.M), requires_grad=True)
         self.std = nn.Parameter(torch.randn(self.k,self.M), requires_grad=True)
-        self.weights = nn.Parameter(torch.ones(self.k,), requires_grad=False)
+        self.weights = nn.Parameter(torch.ones(self.k,), requires_grad=True)
     
     def forward(self):
         mix = td.Categorical(F.softmax(self.weights))
@@ -328,8 +328,8 @@ if __name__ == "__main__":
     # Parse arguments
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='sample', choices=['train', 'sample', 'eval', 'pca', 'train_multiple'], help='what to do when running the script (default: %(default)s)')
-    parser.add_argument('--model', type=str, default='model_wf', help='file to save model to or load model from (default: %(default)s)')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'sample', 'eval', 'pca', 'train_multiple'], help='what to do when running the script (default: %(default)s)')
+    parser.add_argument('--model', type=str, default='model', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
@@ -424,17 +424,19 @@ if __name__ == "__main__":
 
             means = []
             std = []
-            
+            labels = []
             for batch in mnist_train_loader:
                 data = batch[0].to(device)
                 dist = model.encoder(data)
                 means.append(dist.mean)
                 std.append(dist.stddev)
+                labels.append(batch[1])
             means = torch.cat(means, dim=0)
             std = torch.cat(std, dim=0)
+            labels = torch.cat(labels, dim=0)
 
         # draw_contours(means, std, model.prior(), f"contours_{args.prior}_{args.latent_dim}.png", multivariate="gaussian"!=args.prior)
-        draw_contours_points(means, std, model.prior(), f"contoursp_{args.prior}_{args.latent_dim}.png", multivariate="gaussian"!=args.prior)
+        draw_contours_points(means, std, model.prior(), f"contoursp_{args.prior}_{args.latent_dim}.png", title=args.prior, multivariate="gaussian"!=args.prior, labels=labels)
         # draw_contours_points_2d(means, std, model.prior(), f"contoursp2_{args.prior}_{args.latent_dim}.png", multivariate="gaussian"!=args.prior)
 
     
