@@ -125,7 +125,7 @@ def draw_contours_points(data_mean, data_std, prior_dist, img_name, title, multi
     samples = prior_distribution_2d.sample((1000,))
     log_p = data_distribution_2d.log_prob(samples)
     log_q = prior_distribution_2d.log_prob(samples)
-    kl = th.mean(log_p - log_q)
+    kl = th.mean(log_q - log_p)
     
     # Plot contours 
     data_points_2d = data_mean @ principal_components
