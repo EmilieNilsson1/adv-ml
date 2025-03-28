@@ -15,7 +15,6 @@ from copy import deepcopy
 import os
 import math
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 
 class GaussianPrior(nn.Module):
     def __init__(self, M):
@@ -93,43 +92,29 @@ class GaussianDecoder(nn.Module):
         means = self.decoder_net(z)
         return td.Independent(td.Normal(loc=means, scale=1e-1), 3)
 
-class FlattenOutDecoder(nn.Module): 
-    def __init__(self, decoder, output_scale=True, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.decoder = decoder 
-        self.output_scale = output_scale
-        
-    def forward(self, z): 
-        decoding_dist = self.decoder(z)
-        mean = torch.flatten(decoding_dist.base_dist.loc, start_dim=1, end_dim=-1)
-        std = torch.flatten(decoding_dist.base_dist.scale, start_dim=1, end_dim=-1)
-
-        if self.output_scale: return mean, std 
-        else: return mean 
-    
 
 class VAE(nn.Module):
     """
     Define a Variational Autoencoder (VAE) model.
     """
 
-    def __init__(self, prior, decoder, encoder):
+    def __init__(self, prior, decoders, encoder):
         """
         Parameters:
         prior: [torch.nn.Module]
            The prior distribution over the latent space.
-        decoder: [torch.nn.Module]
-              The decoder distribution over the data space.
+        decoders: list[torch.nn.Module]
+              A list of decoder distributions over the data space.
         encoder: [torch.nn.Module]
                 The encoder distribution over the latent space.
         """
 
         super(VAE, self).__init__()
         self.prior = prior
-        self.decoder = decoder
+        self.decoders = decoders
         self.encoder = encoder
 
-    def elbo(self, x):
+    def elbo(self, x, decoder_idx):
         """
         Compute the ELBO for the given batch of data.
 
@@ -138,35 +123,38 @@ class VAE(nn.Module):
            A tensor of dimension `(batch_size, feature_dim1, feature_dim2, ...)`
            n_samples: [int]
            Number of samples to use for the Monte Carlo estimate of the ELBO.
+        decoder_idx: [int]
         """
         q = self.encoder(x)
         z = q.rsample()
 
         elbo = torch.mean(
-            self.decoder(z).log_prob(x) - q.log_prob(z) + self.prior().log_prob(z)
+            self.decoders[decoder_idx](z).log_prob(x) - q.log_prob(z) + self.prior().log_prob(z)
         )
         return elbo
 
-    def sample(self, n_samples=1):
+    def sample(self, n_samples=1, decoder_idx=0):
         """
         Sample from the model.
 
         Parameters:
         n_samples: [int]
            Number of samples to generate.
+        decoder_idx: [int]
         """
         z = self.prior().sample(torch.Size([n_samples]))
-        return self.decoder(z).sample()
+        return self.decoders[decoder_idx](z).sample()
 
-    def forward(self, x):
+    def forward(self, x, ensemble_idx):
         """
         Compute the negative ELBO for the given batch of data.
 
         Parameters:
         x: [torch.Tensor]
            A tensor of dimension `(batch_size, feature_dim1, feature_dim2)`
+        ensemble_idx: [int]
         """
-        return -self.elbo(x)
+        return -self.elbo(x, ensemble_idx)
 
 
 def train(model, optimizer, data_loader, epochs, device):
@@ -201,7 +189,7 @@ def train(model, optimizer, data_loader, epochs, device):
                 model = model
                 optimizer.zero_grad()
                 # from IPython import embed; embed()
-                loss = model(x)
+                loss = model(x, torch.randint(0, len(model.decoders), (1,)).item())
                 loss.backward()
                 optimizer.step()
 
@@ -220,48 +208,6 @@ def train(model, optimizer, data_loader, epochs, device):
                 )
                 break
 
-def get_geo(start_p, end_p, decoder, device, N=10, scale=False):
-    decoder = FlattenOutDecoder(decoder, output_scale=scale) 
-    
-    def metric(z): 
-        jac = torch.autograd.functional.jacobian(decoder, z).squeeze() 
-        if not scale : 
-            riemannian = jac.T @ jac
-        else : 
-            raise NotImplementedError 
-        return riemannian
-    
-    # start_p.requires_grad = True 
-    # end_p.requires_grad = True 
-    
-    return geo_min_energy(start_p=start_p, end_p=end_p, metric=metric, N=N, device=device)
-    
-def geo_min_energy(start_p, end_p, metric, N, device, max_epochs=100):
-    d = start_p.shape[1]
-    points = torch.randn((N, d), requires_grad=True, device=device)
-    optimizer = torch.optim.LBFGS([points], lr=1e-1)
-
-    def closure():
-        optimizer.zero_grad()
-        trajectory = torch.concat((start_p, points, end_p))
-        
-        loss = 0
-        for i in range(len(trajectory)- 1):
-            dif = (trajectory[i+1:i+2] - trajectory[i:i+1])
-            G = metric(trajectory[i:i+1]) 
-            loss += dif @ G @ dif.T
-        
-        loss.backward()
-        return loss  # LBFGS needs the loss value to be returned
-    
-    loss = torch.inf 
-    for i in range(max_epochs): 
-        loss_new = optimizer.step(closure)  # Pass the closure to LBFGS
-        print(loss_new)
-        if loss - loss_new < 0.1: break 
-        loss = loss_new 
-
-    return torch.concat((start_p, points, end_p)), loss
 
 if __name__ == "__main__":
     from torchvision import datasets, transforms
@@ -272,9 +218,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode",
+        "mode",
         type=str,
-        default="geodesics",
+        default="train",
         choices=["train", "sample", "eval", "geodesics"],
         help="what to do when running the script (default: %(default)s)",
     )
@@ -431,7 +377,7 @@ if __name__ == "__main__":
         os.makedirs(f"{experiments_folder}", exist_ok=True)
         model = VAE(
             GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
+            [GaussianDecoder(new_decoder()) for _ in range(args.num_decoders)],
             GaussianEncoder(new_encoder()),
         ).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -452,14 +398,16 @@ if __name__ == "__main__":
     elif args.mode == "sample":
         model = VAE(
             GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
+            [GaussianDecoder(new_decoder()) for _ in range(args.num_decoders)],
             GaussianEncoder(new_encoder()),
         ).to(device)
         model.load_state_dict(torch.load(args.experiment_folder + "/model.pt"))
         model.eval()
+        
+        decoder_idx = 0
 
         with torch.no_grad():
-            samples = (model.sample(64)).cpu()
+            samples = (model[0].sample(64)).cpu()
             save_image(samples.view(64, 1, 28, 28), args.samples)
 
             data = next(iter(mnist_test_loader))[0].to(device)
@@ -472,7 +420,7 @@ if __name__ == "__main__":
         # Load trained model
         model = VAE(
             GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
+            [GaussianDecoder(new_decoder()) for _ in range(args.num_decoders)],
             GaussianEncoder(new_encoder()),
         ).to(device)
         model.load_state_dict(torch.load(args.experiment_folder + "/model.pt"))
@@ -480,9 +428,10 @@ if __name__ == "__main__":
 
         elbos = []
         with torch.no_grad():
-            for x, y in mnist_test_loader:
+            for i, (x, y) in enumerate(mnist_test_loader):
                 x = x.to(device)
-                elbo = model.elbo(x)
+                i = i % args.num_decoders
+                elbo = model.elbo(x, i)
                 elbos.append(elbo)
         mean_elbo = torch.tensor(elbos).mean()
         print("Print mean test elbo:", mean_elbo)
@@ -496,54 +445,3 @@ if __name__ == "__main__":
         ).to(device)
         model.load_state_dict(torch.load(args.experiment_folder + "/model.pt"))
         model.eval()
-        
-        # Store all datapoints in array : 
-        latent_points = torch.zeros((len(mnist_train_loader.dataset), 2), device=device)
-        labels = torch.zeros((len(mnist_train_loader.dataset)), device=device)
-        curr_pointer = 0
-        for batch in mnist_train_loader:
-            imgs = batch[0].to(device)
-            zs = model.encoder(imgs).base_dist.mean
-            labels[curr_pointer:curr_pointer+len(zs)] = batch[1]
-            latent_points[curr_pointer:curr_pointer+len(zs)] = zs.detach()
-            curr_pointer += len(zs) 
-        
-        # Go through K pairs randomly sampled? 
-        K = 25
-        N = 10
-        paths = torch.zeros((K, N+2, 2), device=device)
-        lengths = torch.zeros((K), device=device)
-        for i in tqdm(range(K)): 
-            choices = torch.multinomial(torch.ones(len(latent_points))/len(latent_points), 2).to(device)
-            endpoints = latent_points[choices]
-            start_p = endpoints[0][None, :]
-            end_p = endpoints[1][None, :]
-            
-            trajectory, length = get_geo(start_p, end_p, model.decoder, N=N, device=device)
-            
-            paths[i] = trajectory.detach()
-            lengths[i] = length.detach()
-        
-        latent_points = latent_points.to('cpu')
-        paths = paths.to('cpu')
-        lengths = lengths.to('cpu')
-        
-        cmap = plt.get_cmap("tab10")
-        colors = [cmap(int(label)) for label in labels]
-        unique_labels = torch.unique(labels)
-        
-        # Plot latent representation of all points 
-        plt.scatter(latent_points[:, 0], latent_points[:,1], c=colors, s=1, marker='o')
-        legend = [Line2D([0], [0], color=cmap(int(i)), marker='o', linestyle='None', markersize=10, label=f'{int(i)}') for i in unique_labels]
-        plt.legend(handles=legend)
-        # Plot trajectories 
-        plt.plot(paths[:, :, 0].T, paths[:, :, 1].T, 'g-', alpha=0.5)
-        plt.plot(paths[:, 0, 0], paths[:, 0, 1], 'g.')
-        plt.plot(paths[:, -1, 0], paths[:, -1, 1], 'g.')
-        # Show the distance for each line 
-        for line in range(len(paths)): 
-            pos = paths[line, N//2]
-            plt.text(pos[0], pos[1], f'{lengths[line].item():.1f}', fontsize=8, ha='center', va='center', color='black')
-        plt.savefig('25path_latent_space.png')
-        #TODO grid? 
-        plt.show()
