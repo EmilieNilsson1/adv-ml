@@ -6,6 +6,21 @@
 #
 # Significant extension by Søren Hauberg, 2024
 
+
+
+
+
+
+
+# TODO : We calculate the energy, but if we want the length we need to take the sqrt. 
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.distributions as td
@@ -16,6 +31,9 @@ import os
 import math
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import matplotlib.patheffects as pe
 
 class GaussianPrior(nn.Module):
     def __init__(self, M):
@@ -93,14 +111,43 @@ class GaussianDecoder(nn.Module):
         means = self.decoder_net(z)
         return td.Independent(td.Normal(loc=means, scale=1e-1), 3)
 
+class EnsembleDecoder(nn.Module): 
+    def __init__(self, decoder_nets):
+        """
+        Define a Bernoulli decoder distribution based on a given decoder network.
+
+        Parameters:
+        encoder_net: [torch.nn.Module]
+           The decoder network that takes as a tensor of dim `(batch_size, M) as
+           input, where M is the dimension of the latent space, and outputs a
+           tensor of dimension (batch_size, feature_dim1, feature_dim2).
+        """
+        super(EnsembleDecoder, self).__init__()
+        self.decoder_net = nn.ModuleList(decoder_nets)
+        self.number_of_decoders = len(decoder_nets)
+        # self.std = nn.Parameter(torch.ones(28, 28) * 0.5, requires_grad=True) # In case you want to learn the std of the gaussian.
+
+    def forward(self, z, choice=None):
+        """
+        Given a batch of latent variables, return a Bernoulli distribution over the data space.
+
+        Parameters:
+        z: [torch.Tensor]
+           A tensor of dimension `(batch_size, M)`, where M is the dimension of the latent space.
+        """
+        if choice is None : choice = torch.randint(0, self.number_of_decoders, size=(1,))[0]
+        decoder_net = self.decoder_net[choice]
+        means = decoder_net(z)
+        return td.Independent(td.Normal(loc=means, scale=1e-1), 3)
+
 class FlattenOutDecoder(nn.Module): 
     def __init__(self, decoder, output_scale=True, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.decoder = decoder 
         self.output_scale = output_scale
         
-    def forward(self, z): 
-        decoding_dist = self.decoder(z)
+    def forward(self, z, **kwargs): 
+        decoding_dist = self.decoder(z, **kwargs)
         mean = torch.flatten(decoding_dist.base_dist.loc, start_dim=1, end_dim=-1)
         std = torch.flatten(decoding_dist.base_dist.scale, start_dim=1, end_dim=-1)
 
@@ -220,48 +267,100 @@ def train(model, optimizer, data_loader, epochs, device):
                 )
                 break
 
-def get_geo(start_p, end_p, decoder, device, N=10, scale=False):
-    decoder = FlattenOutDecoder(decoder, output_scale=scale) 
-    
-    def metric(z): 
-        jac = torch.autograd.functional.jacobian(decoder, z).squeeze() 
-        if not scale : 
-            riemannian = jac.T @ jac
-        else : 
-            raise NotImplementedError 
-        return riemannian
-    
-    # start_p.requires_grad = True 
-    # end_p.requires_grad = True 
-    
-    return geo_min_energy(start_p=start_p, end_p=end_p, metric=metric, N=N, device=device)
-    
-def geo_min_energy(start_p, end_p, metric, N, device, max_epochs=100):
+def get_geo(start_p, end_p, decoder, device, mc_samples = 1,  N=100, max_epochs=10):
+    decoder = FlattenOutDecoder(decoder, output_scale=False) 
     d = start_p.shape[1]
-    points = torch.randn((N, d), requires_grad=True, device=device)
-    optimizer = torch.optim.LBFGS([points], lr=1e-1)
+    good_opt = False
+    while not good_opt: 
+        # points = torch.randn((N, d), requires_grad=True, device=device)
+        points = torch.stack([torch.linspace(start_p[0,0], end_p[0,0], steps=N+2, device=device), torch.linspace(start_p[0, 1], end_p[0, 1], steps=N+2, device=device)], dim=1).detach()
+        points = points[1:-1].requires_grad_()
+        optimizer = torch.optim.LBFGS([points], lr=1e-1)
 
-    def closure():
-        optimizer.zero_grad()
-        trajectory = torch.concat((start_p, points, end_p))
+        def closure():
+            optimizer.zero_grad()
+            trajectory = torch.concat((start_p, points, end_p))
+            
+            curve_energy = 0
+            for i in range(len(trajectory)- 1): 
+                star_points = torch.cat([decoder(trajectory[i:i+1]) for _ in range(mc_samples)])
+                end_points = torch.cat([decoder(trajectory[i+1:i+2]) for _ in range(mc_samples)])
+                curve_energy += torch.nn.functional.mse_loss(star_points, end_points)        
+            curve_energy.backward()
+            return curve_energy  # LBFGS needs the curve_energy value to be returned
         
-        loss = 0
-        for i in range(len(trajectory)- 1):
-            dif = (trajectory[i+1:i+2] - trajectory[i:i+1])
-            G = metric(trajectory[i:i+1]) 
-            loss += dif @ G @ dif.T
+        curve_energy = torch.inf 
+        for i in range(max_epochs):
+            curve_energy_new = optimizer.step(closure)  # Pass the closure to LBFGS
+            print(curve_energy)
+            if i == 0: 
+                init_curve_energy = curve_energy_new
+            if abs(curve_energy - curve_energy_new) <= 0.00001: 
+                good_opt = True
+                break 
+            curve_energy = curve_energy_new 
         
-        loss.backward()
-        return loss  # LBFGS needs the loss value to be returned
+        if init_curve_energy > curve_energy: good_opt = True
+
+    return torch.concat((start_p, points, end_p)), curve_energy
+
+def curve_length(trajectory, decoder, mode="mean"):
+    decoder = FlattenOutDecoder(decoder, output_scale=False)
+    if mode=="mean":
+        dist = 0 
+        for i in range(decoder.decoder.number_of_decoders):    
+            img_traj = decoder(trajectory, choice=i)
+            dif = img_traj[1:] - img_traj[:-1]
+            dist += torch.sum(torch.norm(dif, dim=1))
+        dist = dist / decoder.decoder.number_of_decoders
+    else: 
+        img_traj = decoder(trajectory)
+        dif = img_traj[1:] - img_traj[:-1]
+        dist = torch.sum(torch.norm(dif, dim=1))
+    return dist 
     
-    loss = torch.inf 
-    for i in range(max_epochs): 
-        loss_new = optimizer.step(closure)  # Pass the closure to LBFGS
-        print(loss_new)
-        if loss - loss_new < 0.1: break 
-        loss = loss_new 
+# def get_geo(start_p, end_p, decoder, device, N=10, scale=False):
+#     decoder = FlattenOutDecoder(decoder, output_scale=scale) 
+    
+#     def metric(z): 
+#         jac = torch.autograd.functional.jacobian(decoder, z).squeeze() 
+#         if not scale : 
+#             riemannian = jac.T @ jac
+#         else : 
+#             raise NotImplementedError 
+#         return riemannian
+    
+#     # start_p.requires_grad = True 
+#     # end_p.requires_grad = True 
+    
+#     return geo_min_energy(start_p=start_p, end_p=end_p, metric=metric, N=N, device=device)
+    
+# def geo_min_energy(start_p, end_p, metric, N, device, max_epochs=100):
+#     d = start_p.shape[1]
+#     points = torch.randn((N, d), requires_grad=True, device=device)
+#     optimizer = torch.optim.LBFGS([points], lr=1e-1)
 
-    return torch.concat((start_p, points, end_p)), loss
+#     def closure():
+#         optimizer.zero_grad()
+#         trajectory = torch.concat((start_p, points, end_p))
+        
+#         loss = 0
+#         for i in range(len(trajectory)- 1):
+#             dif = (trajectory[i+1:i+2] - trajectory[i:i+1])
+#             G = metric(trajectory[i:i+1]) 
+#             loss += dif @ G @ dif.T
+        
+#         loss.backward()
+#         return loss  # LBFGS needs the loss value to be returned
+    
+#     loss = torch.inf 
+#     for i in range(max_epochs): 
+#         loss_new = optimizer.step(closure)  # Pass the closure to LBFGS
+#         print(loss_new)
+#         if loss - loss_new < 0.1: break 
+#         loss = loss_new 
+
+#     return torch.concat((start_p, points, end_p)), loss
 
 if __name__ == "__main__":
     from torchvision import datasets, transforms
@@ -275,13 +374,13 @@ if __name__ == "__main__":
         "--mode",
         type=str,
         default="geodesics",
-        choices=["train", "sample", "eval", "geodesics"],
+        choices=["train", "ntrain", "save_data", "sample", "eval", "geodesics", "evaluate_cov"],
         help="what to do when running the script (default: %(default)s)",
     )
     parser.add_argument(
         "--experiment-folder",
         type=str,
-        default="experiment",
+        default="bigchunker",
         help="folder to save and load experiment results in (default: %(default)s)",
     )
     parser.add_argument(
@@ -322,7 +421,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-decoders",
         type=int,
-        default=3,
+        default=10,
         metavar="N",
         help="number of decoders in the ensemble (default: %(default)s)",
     )
@@ -429,17 +528,28 @@ if __name__ == "__main__":
 
         experiments_folder = args.experiment_folder
         os.makedirs(f"{experiments_folder}", exist_ok=True)
-        model = VAE(
-            GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
-            GaussianEncoder(new_encoder()),
-        ).to(device)
+        
+        if args.num_decoders == 1: 
+            model = VAE(
+                GaussianPrior(M),
+                GaussianDecoder(new_decoder()),
+                GaussianEncoder(new_encoder()),
+            ).to(device)
+            epochs = args.epochs_per_decoder
+        else: 
+            model = VAE(
+                GaussianPrior(M),
+                EnsembleDecoder([new_decoder() for _ in range(args.num_decoders)]),
+                GaussianEncoder(new_encoder()),
+            ).to(device)
+            epochs = args.epochs_per_decoder * args.num_decoders
+        
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         train(
             model,
             optimizer,
             mnist_train_loader,
-            args.epochs_per_decoder,
+            epochs,
             args.device,
         )
         os.makedirs(f"{experiments_folder}", exist_ok=True)
@@ -448,6 +558,40 @@ if __name__ == "__main__":
             model.state_dict(),
             f"{experiments_folder}/model.pt",
         )
+    
+    elif args.mode == "ntrain":
+        experiments_folder = args.experiment_folder
+        os.makedirs(f"{experiments_folder}", exist_ok=True)
+        
+        for i in range(args.num_reruns):
+            if args.num_decoders == 1: 
+                model = VAE(
+                    GaussianPrior(M),
+                    GaussianDecoder(new_decoder()),
+                    GaussianEncoder(new_encoder()),
+                ).to(device)
+                epochs = args.epochs_per_decoder
+            else: 
+                model = VAE(
+                    GaussianPrior(M),
+                    EnsembleDecoder([new_decoder() for _ in range(args.num_decoders)]),
+                    GaussianEncoder(new_encoder()),
+                ).to(device)
+                epochs = args.epochs_per_decoder * args.num_decoders
+            
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+            train(
+                model,
+                optimizer,
+                mnist_train_loader,
+                epochs,
+                args.device,
+            )
+
+            torch.save(
+                model.state_dict(),
+                f"{experiments_folder}/model_{i}.pt",
+            )
 
     elif args.mode == "sample":
         model = VAE(
@@ -486,14 +630,30 @@ if __name__ == "__main__":
                 elbos.append(elbo)
         mean_elbo = torch.tensor(elbos).mean()
         print("Print mean test elbo:", mean_elbo)
-
+    elif args.mode == "save_data": 
+        mnist_test_loader = torch.utils.data.DataLoader(
+            test_data, batch_size=64, shuffle=True
+        )
+        batch = next(iter(mnist_test_loader))
+        torch.save({'imgs':batch[0], 'labels':batch[0]}, 'data4later.pt')
+        
     elif args.mode == "geodesics":
 
-        model = VAE(
-            GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
-            GaussianEncoder(new_encoder()),
-        ).to(device)
+        if args.num_decoders == 1: 
+            model = VAE(
+                GaussianPrior(M),
+                GaussianDecoder(new_decoder()),
+                GaussianEncoder(new_encoder()),
+            ).to(device)
+            length_calculation_ting = "notmean"
+        else: 
+            model = VAE(
+                GaussianPrior(M),
+                EnsembleDecoder([new_decoder() for _ in range(args.num_decoders)]),
+                GaussianEncoder(new_encoder()),
+            ).to(device)
+            length_calculation_ting = "mean"
+        
         model.load_state_dict(torch.load(args.experiment_folder + "/model.pt"))
         model.eval()
         
@@ -504,22 +664,24 @@ if __name__ == "__main__":
         for batch in mnist_train_loader:
             imgs = batch[0].to(device)
             zs = model.encoder(imgs).base_dist.mean
-            labels[curr_pointer:curr_pointer+len(zs)] = batch[1]
+            labels[curr_pointer:curr_pointer+len(imgs)] = batch[1]
             latent_points[curr_pointer:curr_pointer+len(zs)] = zs.detach()
-            curr_pointer += len(zs) 
+            curr_pointer += len(imgs) 
         
         # Go through K pairs randomly sampled? 
         K = 25
         N = 10
         paths = torch.zeros((K, N+2, 2), device=device)
         lengths = torch.zeros((K), device=device)
+        fixed_data = torch.load('data4later.pt')
+        imgs = fixed_data['imgs']
+        # labels = fixed_data['labels']
         for i in tqdm(range(K)): 
-            choices = torch.multinomial(torch.ones(len(latent_points))/len(latent_points), 2).to(device)
-            endpoints = latent_points[choices]
-            start_p = endpoints[0][None, :]
-            end_p = endpoints[1][None, :]
+            start_p = model.encoder(imgs[i*2:i*2+1]).base_dist.mean.detach()
+            end_p = model.encoder(imgs[i*2+1:i*2+2]).base_dist.mean.detach()
             
-            trajectory, length = get_geo(start_p, end_p, model.decoder, N=N, device=device)
+            trajectory, energies = get_geo(start_p, end_p, model.decoder, N=N, device=device, mc_samples=10)
+            length = curve_length(trajectory=trajectory, decoder=model.decoder, mode=length_calculation_ting)
             
             paths[i] = trajectory.detach()
             lengths[i] = length.detach()
@@ -527,23 +689,97 @@ if __name__ == "__main__":
         latent_points = latent_points.to('cpu')
         paths = paths.to('cpu')
         lengths = lengths.to('cpu')
+        torch.save({'paths': paths, 'lengths': lengths, 'latent_points': latent_points}, args.experiment_folder + '/results25latentspace.pth')
+        # temp = torch.load('results25latentspace.pth')
+        # paths = temp['paths']
+        # lengths = temp['lengths']
         
-        cmap = plt.get_cmap("tab10")
+        cmap = plt.get_cmap("Paired")
+        # cmap = plt.get_cmap("tab10")
         colors = [cmap(int(label)) for label in labels]
         unique_labels = torch.unique(labels)
-        
+
         # Plot latent representation of all points 
+        fig = plt.figure()
         plt.scatter(latent_points[:, 0], latent_points[:,1], c=colors, s=1, marker='o')
         legend = [Line2D([0], [0], color=cmap(int(i)), marker='o', linestyle='None', markersize=10, label=f'{int(i)}') for i in unique_labels]
         plt.legend(handles=legend)
+
         # Plot trajectories 
-        plt.plot(paths[:, :, 0].T, paths[:, :, 1].T, 'g-', alpha=0.5)
-        plt.plot(paths[:, 0, 0], paths[:, 0, 1], 'g.')
-        plt.plot(paths[:, -1, 0], paths[:, -1, 1], 'g.')
+        cmap2 = plt.get_cmap("spring")
+        norm = mcolors.Normalize(vmin=lengths.min().item(), vmax=lengths.max().item())
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap2)
+        for i in range(5, len(paths)): 
+            #plt.plot(paths[i, :, 0].T, paths[i, :, 1].T, '-', alpha=0.3, color=sm.to_rgba(lengths[i]))
+            plt.plot(paths[i, :, 0].T, paths[i, :, 1].T, '-', alpha=0.5, color='k')
+            plt.plot(paths[i, 0, 0], paths[i, 0, 1], 'k.')
+            plt.plot(paths[i, -1, 0], paths[i, -1, 1], 'k.')
+
+        # Plot special paths 
+        list_of_shapes = ["*", "s", "p", "P", "D"]  
+        for i in range(0, 5): 
+            plt.plot(paths[i, :, 0].T, paths[i, :, 1].T, '-', lw=2, alpha=1, color=sm.to_rgba(lengths[i]))#, path_effects=[pe.Stroke(linewidth=5, foreground='k'), pe.Normal()])
+            plt.plot(paths[i, 0, 0], paths[i, 0, 1], markersize=7, marker=list_of_shapes[i], color=sm.to_rgba(lengths[i]))
+            plt.plot(paths[i, -1, 0], paths[i, -1, 1], markersize=7, marker=list_of_shapes[i], color=sm.to_rgba(lengths[i]))
+        plt.colorbar(sm, ax=fig.axes[0])
+        plt.axis('off')
         # Show the distance for each line 
-        for line in range(len(paths)): 
-            pos = paths[line, N//2]
-            plt.text(pos[0], pos[1], f'{lengths[line].item():.1f}', fontsize=8, ha='center', va='center', color='black')
-        plt.savefig('25path_latent_space.png')
+        # for line in range(len(paths)): 
+        #     pos = paths[line, N//2]
+        #     plt.text(pos[0], pos[1], f'{lengths[line].item():.1f}', fontsize=8, ha='center', va='center', color='black')
+        plt.savefig(args.experiment_folder +'/25path_latent_space.png')
         #TODO grid? 
         plt.show()
+        
+    elif args.mode == "evaluate_cov":  
+        N = 10
+        distances = torch.ones((args.num_reruns, args.num_decoders, 10))
+        eudist = torch.ones((args.num_reruns, 10))
+
+        fixed_data = torch.load('data4later.pt')
+        imgs = fixed_data['imgs'][0:20]
+
+        # Go through models, number of decoders, number of pairs
+        for i in tqdm(range(args.num_reruns)): 
+            # Load model
+            model = VAE(
+                GaussianPrior(M),
+                EnsembleDecoder([new_decoder() for _ in range(args.num_decoders)]),
+                GaussianEncoder(new_encoder()),
+            ).to(device)
+            
+            model.load_state_dict(torch.load(args.experiment_folder + f"/model_{i}.pt"))
+            model.eval()
+            
+            encodings = model.encoder(imgs).base_dist.mean.detach() 
+            
+            eudist[i] = torch.norm(encodings[::2] - encodings[1::2], dim=1) 
+            
+            for j in range(args.num_decoders): 
+                model.decoder.number_of_decoders = j + 1
+                
+                for k in range(10): 
+                    start_p = encodings[k*2:k*2+1]
+                    end_p = encodings[k*2+1:k*2+2]
+            
+                    trajectory, energies = get_geo(start_p, end_p, model.decoder, N=N, device=device, mc_samples=2*(j+1))
+                    distances[i,j,k] = curve_length(trajectory=trajectory, decoder=model.decoder, mode='mean')
+
+        # Save the distances 
+        torch.save({'geodesic': distances, 'euclidean': eudist}, args.experiment_folder + "/distances.pt")
+        
+        means = distances.mean(dim=0)
+        stds = distances.std(dim=0)
+        
+        geo_cov = stds/means 
+        eu_cov = eudist.std(dim=0) / eudist.mean(dim=0)
+        
+        mean_geo_cov = geo_cov.mean(dim=-1)
+        mean_eu_cov = eu_cov.mean(dim=-1)
+        
+        plt.plot([1,2,3], mean_geo_cov.detach(), '-g', label="Geodesics")
+        plt.plot([1,2,3], torch.ones(3)*mean_eu_cov.detach(), '-r', label="Euclidean")
+        plt.legend()
+        plt.savefig('thecovofcovsity.png')
+        plt.show()        
+        
