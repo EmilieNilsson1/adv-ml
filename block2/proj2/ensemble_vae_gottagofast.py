@@ -289,8 +289,9 @@ def train(model, optimizer, data_loader, epochs, device):
 
 
 def get_pairs(n_pairs: int) -> torch.Tensor:
-    rng = torch.Generator().manual_seed(1337)
+    rng = torch.Generator().manual_seed(12)
     return torch.randperm(len(test_data), generator=rng)[:(n_pairs*2)].view(-1, 2)
+
 
 def curve(latent_pairs: torch.Tensor, inner_points: torch.Tensor) -> torch.Tensor:
     return torch.concat((latent_pairs[:, 0:1], inner_points, latent_pairs[:, 1:2]), dim=1)
@@ -305,7 +306,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "mode",
         type=str,
-        default="sample",
+        default="plot",
         choices=["train", "sample", "eval", "geodesics", "plot", "cov"],
         help="what to do when running the script (default: %(default)s)",
     )
@@ -459,6 +460,8 @@ if __name__ == "__main__":
                 optimizer,
                 mnist_train_loader,
                 args.epochs_per_decoder * args.num_decoders,
+                # # NOTE: Not adjusting by number of decoders, because the file came like this
+                # args.epochs_per_decoder,
                 args.device,
             )
 
@@ -509,12 +512,13 @@ if __name__ == "__main__":
     elif args.mode == "geodesics":
         # Settings
         n_pairs = 25
-        n_curve_points = 30
-        n_energy_samples = min(10, args.num_decoders)
-        learning_rate = 1e-1
-        steps = 500
-        tolerance = 1e-2
+        n_curve_points = 20
+        n_energy_samples = 2 * args.num_decoders
+        learning_rate = 4e-2
+        steps_per_decoder = 400 // args.num_decoders
+        tolerance = 1e-1
         tolerance_divergence = 1.10
+        tolerance_diverged = 10.00
         
         # Make results directory for geodesics
         os.makedirs(f"{args.experiment_folder}/curves/{args.num_decoders}/", exist_ok=True)
@@ -531,6 +535,7 @@ if __name__ == "__main__":
 
 
         for rerun_idx in tqdm(range(args.num_reruns), desc=f"Reruns for num_decoders: {args.num_decoders}"):
+            # Use new encoder all the time
             model = VAE(
                 GaussianPrior(M),
                 Ensemble([GaussianDecoder(new_decoder()) for _ in range(args.num_decoders)]),
@@ -539,6 +544,22 @@ if __name__ == "__main__":
 
             model.load_state_dict(torch.load(f"{args.experiment_folder}/models/{args.num_decoders}/{rerun_idx}.pt"))
             model.eval()
+
+
+            # Use the same encoder for all decoders
+            # model = VAE(
+            #     GaussianPrior(M),
+            #     Ensemble([GaussianDecoder(new_decoder()) for _ in range(10)]),
+            #     GaussianEncoder(new_encoder()),
+            # ).to(device)
+
+            # model.load_state_dict(torch.load(f"{args.experiment_folder}/models/10/{rerun_idx}.pt"))
+            # model.eval()
+
+            # model.decoder.models = model.decoder.models[:args.num_decoders]
+
+
+
 
             # Shape pipeline
             # ======================================================================
@@ -586,31 +607,58 @@ if __name__ == "__main__":
                 #     ], dim=1)
                 #     for start, end in latent_pairs
                 # ])
-
-                # Initialized as random points between start and end
+                
+                # Initialized as line between start and end with noise
                 params = torch.stack([
                     torch.stack([
-                        (torch.rand(n_curve_points - 2, device=device, generator=rng)- 0.5) * (end[d] - start[d]) + (start[d] + end[d]) / 2
+                        torch.linspace(start[d], end[d], n_curve_points, device=device)[1:-1] + (torch.rand(n_curve_points - 2, device=device, generator=rng) - 0.5) * (end[d] - start[d]) / (n_curve_points - 2) * 4
                         for d in range(M)
                     ], dim=1)
                     for start, end in latent_pairs
                 ])
-                
+
+                # Initialized as random points between start and end
+                # params = torch.stack([
+                #     torch.stack([
+                #         (torch.rand(n_curve_points - 2, device=device, generator=rng) - 0.5) * (end[d] - start[d]) + (start[d] + end[d]) / 2
+                #         for d in range(M)
+                #     ], dim=1)
+                #     for start, end in latent_pairs
+                # ])
+
 
 
                 # [point_pairs, parameter_size]
                 params = params.to(device).requires_grad_()
+                # params = [param.requires_grad_() for param in params.to(device)]
+
+                # optimizer = torch.optim.AdamW(
+                #     params=[params],
+                #     lr=learning_rate,
+                #     weight_decay=0.0,
+                # )
 
                 optimizer = torch.optim.LBFGS(
                     params=[params],
                     lr=learning_rate,
                     tolerance_change=tolerance,
                 )
+                # optimizers = [
+                #     torch.optim.AdamW(
+                #         params=[param],
+                #         lr=learning_rate,
+                #         weight_decay=0.0
+                #     )
+                #     for param in params
+                # ]
 
 
                 def curve_energy() -> torch.Tensor:
                     optimizer.zero_grad()
                     z = curve(latent_pairs, params)
+                    # for opt in optimizers:
+                    #     opt.zero_grad()
+                    # z = curve(latent_pairs, torch.stack(params))
                     z = z[:, :, None, ...].expand(-1, -1, n_energy_samples, -1).reshape(-1, M)
 
                     model_idx = torch.randint(0, args.num_decoders, (z.shape[0],), device=device, generator=rng)
@@ -626,13 +674,20 @@ if __name__ == "__main__":
 
 
                 # Optimize parameters
-                energy_best = float("inf")
-                for steps in (pbar := tqdm(range(steps), leave=False)):
+                energy_best = curve_energy()
+                for _ in (pbar := tqdm(range(steps_per_decoder * args.num_decoders), leave=False)):
                     energy = optimizer.step(curve_energy)
+                    # energy = curve_energy()
+                    # for opt in optimizers:
+                    #     opt.step()
+                    
                     
                     pbar.set_postfix(mean_energy=f"{energy/n_pairs:.4f}")
                     if (energy := energy.item()) < energy_best:
                         energy_best = energy
+
+                    if energy > energy_best * tolerance_diverged:
+                        break
 
 
                 # If not diverged, break, else try again
@@ -644,6 +699,7 @@ if __name__ == "__main__":
             # Final decoded latents on the geodesic
             with torch.no_grad():
                 z = curve(latent_pairs, params)
+                # z = curve(latent_pairs, torch.stack(params))
                 z = z[:, :, None, ...].expand(-1, -1, args.num_decoders, -1).reshape(-1, M)
 
                 model_idx = torch.arange(args.num_decoders, device=device).repeat(n_pairs*n_curve_points)
@@ -653,6 +709,7 @@ if __name__ == "__main__":
 
             # Save the parameters, latents, and decoded latents
             torch.save(params.detach().cpu(), f"{args.experiment_folder}/curves/{args.num_decoders}/{rerun_idx}.pt")
+            # torch.save(torch.stack(params).detach().cpu(), f"{args.experiment_folder}/curves/{args.num_decoders}/{rerun_idx}.pt")
             torch.save(latents.detach().cpu(), f"{args.experiment_folder}/latents/{args.num_decoders}/{rerun_idx}.pt")
             torch.save(x.cpu(), f"{args.experiment_folder}/decoded/{args.num_decoders}/{rerun_idx}.pt")
 
@@ -679,7 +736,7 @@ if __name__ == "__main__":
         fig, ax = plt.subplots(figsize=(4, 4), dpi=300)
         
         # Disable axis
-        ax.set_axis_off()
+        # ax.set_axis_off()
 
         # Plot all the latents
         cmap_latent = mpl.colormaps["Paired"]
@@ -700,15 +757,12 @@ if __name__ == "__main__":
         cmap_mapper = ScalarMappable(norm=cmap_norm, cmap=cmap_highlight)
         
         for shape, (start, end), c, d in zip(shapes, latent_pairs, curves, dists):
-            print(d)
             color = cmap_mapper.to_rgba(d)
             ax.plot(*c.T, color=color, alpha=0.8, lw=1.5)
-            ax.scatter([start[0], end[0]], [start[1], end[1]], c=color, edgecolors="purple", lw=0.5, marker=shape, s=32, zorder=10)
+            ax.scatter([start[0], end[0]], [start[1], end[1]], color=color, edgecolors="purple", lw=0.5, marker=shape, s=32, zorder=10)
 
         # Add colorbar
         cbar = plt.colorbar(cmap_mapper, ax=ax)
-        cbar.set_label("Distance", rotation=270, labelpad=15)
-        cbar.set_ticks([min_dist, max_dist])
 
         plt.show()
 
@@ -733,17 +787,22 @@ if __name__ == "__main__":
 
 
                 dists_all[:, num_decoders-1, rerun_idx] = dists
-                dists_all_euclidean[:, num_decoders-1, rerun_idx] = (latent_pairs[:, 1]- latent_pairs[:, 0]).norm(dim=-1, p=2)
+                dists_all_euclidean[:, num_decoders-1, rerun_idx] = (latent_pairs[:, 1] - latent_pairs[:, 0]).norm(dim=-1, p=2)
 
 
         cov = dists_all.std(dim=-1) / dists_all.mean(dim=-1)
 
-        dists_all_euclidean = dists_all_euclidean.view(n_pairs, -1)
+        dists_all_euclidean = dists_all_euclidean
         cov_euclidean = dists_all_euclidean.std(dim=-1) / dists_all_euclidean.mean(dim=-1)
 
         fig, ax = plt.subplots(figsize=(4, 4), dpi=300)
-        ax.boxplot(cov, label="Geodesics")
-        ax.plot(range(1, args.num_decoders+1), [cov_euclidean.mean(dim=0)] * args.num_decoders, label="Euclidean")
+        ax.plot(range(1, args.num_decoders+1), cov_euclidean.mean(0), label="Euclidean")
+        # NOTE: Outliers are omitted from the boxplot
+        ax.boxplot(cov, label="Geodesics", showfliers=False)
+        # ax.plot(range(1, args.num_decoders+1), cov.T, label="Geodesics", color="red")
+        ax.plot(range(1, args.num_decoders+1), cov.mean(0), color="orange")
+        
+        ax.set_ylim(0.0, 0.40)
 
         ax.legend()
         ax.grid()
