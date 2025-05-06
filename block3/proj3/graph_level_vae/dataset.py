@@ -3,24 +3,6 @@ import torch
 from torch.utils.data import random_split
 from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
-from utils import data_to_A_matrix
-
-# class MUTAGDataset:
-    
-#     def __init__(self, dataset, max_num_nodes = 0):
-#         self.dataset = dataset
-#         self.max_num_nodes = max_num_nodes
-    
-#     def __len__(self):
-#         return len(self.dataset)
-    
-#     def __getitem__(self, idx):
-#         data = self.dataset[idx]
-        
-#         A = data_to_A_matrix(data, self.max_num_nodes)
-        
-#         return A, data.num_nodes
-
 
 def get_data(splits = (100/188, 44/188, 44/188), batch_sizes = (100, 44, 44), split_rng = 420, device = 'cpu'):
     

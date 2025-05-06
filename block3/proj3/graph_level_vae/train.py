@@ -1,10 +1,10 @@
 
 import tqdm
 import torch
-from block3.proj3.graph_level_vae.utils import torch_batch_data_to_A_matrix, remove_isoltated_nodes
+from utils import torch_batch_data_to_A_matrix, remove_isoltated_nodes
 import matplotlib.pyplot as plt
 
-from block3.proj3.graph_level_vae.plotting import draw_graphs, plot_adjacency_matricies
+from plotting import draw_graphs, plot_adjacency_matricies
 
 def train(
         model,
@@ -12,7 +12,6 @@ def train(
         data_loader,
         epochs,
         max_num_nodes,
-        sort_by = "degree",
         device = 'cpu',
     ):
     """
@@ -45,7 +44,7 @@ def train(
         for batch_data in data_iter:
             # x = x[0].to(device)
             optimizer.zero_grad()
-            As = torch_batch_data_to_A_matrix(batch_data, max_num_nodes, sort_by=sort_by).to(device)
+            As = torch_batch_data_to_A_matrix(batch_data, max_num_nodes).to(device)
             loss = model(batch_data.x, batch_data.edge_index, batch=batch_data.batch, A = As)
             loss.backward()
             optimizer.step()
@@ -73,7 +72,7 @@ def train(
             plt.savefig(f"adjacency_epoch_real.png")
             plt.close()
             
-        plt.plot(losses)
+        plt.plot(losses[10:][-100:], label="loss")
         plt.grid()
         plt.savefig("loss.png")
         plt.close()
@@ -102,8 +101,8 @@ def evaluate(model, data_loader, device):
 
 if __name__ == "__main__":
     
-    from block3.proj3.graph_level_vae.dataset import get_data
-    from block3.proj3.graph_level_vae.vae import GraphVAE, SimpleGNN, GaussianPrior, get_decoder_net, GaussianGraphEncoder, BernoulliImageDecoder
+    from dataset import get_data
+    from vae import GraphVAE, SimpleGNN, GaussianPrior, get_decoder_net, GaussianGraphEncoder, BernoulliImageDecoder
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
@@ -145,21 +144,23 @@ if __name__ == "__main__":
         max_num_nodes=data_info["max_num_nodes"],
     ).to(device)
     
-    optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(vae.parameters(), lr=1e-3)
     
     train(
         vae, 
         optimizer, 
         train_loader, 
-        epochs=500, 
+        epochs=2000, 
         max_num_nodes=data_info["max_num_nodes"],
-        sort_by="degree",
         device=device
     )
     
+    # Save the model
+    torch.save(vae.state_dict(), "vae_model.pth")
+    
     vae.eval()
     with torch.no_grad():
-        samples = (vae.sample(64)).cpu() 
+        samples = (vae.sample(36)).cpu() 
         
-        draw_graphs(samples.detach().cpu().numpy(), [data_info["max_num_nodes"]]*len(samples))
+        draw_graphs(samples.detach().cpu().numpy())
         plt.savefig("generated_graphs.png")
