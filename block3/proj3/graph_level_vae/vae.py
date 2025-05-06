@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.distributions as td
 
 
-class GraphGAN(nn.Module):
+class GraphVAE(nn.Module):
     """
     Define a Variational Autoencoder (VAE) model.
     """
-    def __init__(self, prior, decoder, encoder, descriminator, max_num_nodes):
+    def __init__(self, prior, decoder, encoder, max_num_nodes):
         """
         Parameters:
         prior: [torch.nn.Module] 
@@ -18,11 +18,10 @@ class GraphGAN(nn.Module):
                 The encoder distribution over the latent space.
         """
             
-        super(GraphGAN, self).__init__()
+        super(GraphVAE, self).__init__()
         self.prior = prior
         self.decoder = decoder
         self.encoder = encoder
-        self.descriminator = descriminator
         self.max_num_nodes = max_num_nodes
 
     def elbo(self, node_features, edge_index, batch, A):
@@ -45,7 +44,12 @@ class GraphGAN(nn.Module):
            Number of samples to generate.
         """
         z = self.prior().sample(torch.Size([n_samples]))
-        return self.decoder(z).sample()
+        
+        samples = self.decoder(z).sample()
+        upper_tri = torch.triu(torch.ones(self.max_num_nodes, self.max_num_nodes), diagonal=1).to(samples.device)
+        samples = samples * upper_tri + samples.transpose(1, 2) * upper_tri.transpose(0, 1)
+        
+        return samples
     
     def forward(self, node_features, edge_index, batch, A):
         """Evaluate neural network on a batch of graphs.
@@ -166,8 +170,11 @@ def get_decoder_net(latent_dim : int, max_num_nodes : int) -> nn.Module:
         nn.ReLU(),
         nn.Linear(512, 512),
         nn.ReLU(),
+        nn.Linear(512, 512),
+        nn.ReLU(),
         nn.Linear(512, 784),
-        nn.Unflatten(-1, (max_num_nodes, max_num_nodes))
+        nn.Unflatten(-1, (max_num_nodes, max_num_nodes)),
+        nn.Sigmoid(),
     )
     return decoder_net
 
@@ -243,5 +250,6 @@ class BernoulliImageDecoder(nn.Module):
         z: [torch.Tensor] 
            A tensor of dimension `(batch_size, M)`, where M is the dimension of the latent space.
         """
-        logits = self.decoder_net(z)
-        return td.Independent(td.Bernoulli(logits=logits), 2)
+        probs = self.decoder_net(z)
+        
+        return td.Independent(td.Bernoulli(probs=probs), 2)
